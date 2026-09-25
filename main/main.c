@@ -27,7 +27,17 @@ static spi_device_handle_t lcd, touch;
 static uint16_t *pixels;
 static float eye_x, eye_y;
 static float openness = 1.0f;
-static bool happy, sleepy;
+static bool happy;
+static float sleep_amount;
+#define DROWSY_AFTER_MS 40000
+#define ASLEEP_AFTER_MS 60000
+#define WAKE_DURATION_MS 1200
+
+static float smooth_progress(float value)
+{
+    value = fminf(1.0f, fmaxf(0.0f, value));
+    return value * value * (3.0f - 2.0f * value);
+}
 
 
 static void command(uint8_t cmd, const uint8_t *data, int length)
@@ -109,7 +119,7 @@ static void init_hardware(void)
                         .mode = GPIO_MODE_INPUT};
     ESP_ERROR_CHECK(gpio_config(&irq));
 
-}.;
+}
 
 static int adc(uint8_t cmd, bool keep_selected)
 {
@@ -180,7 +190,7 @@ static bool eye_pixel(int x, int y, int center)
 
 static void render(void)
 {
-    uint16_t color = sleepy ? 0x0190 : 0x03FF;
+    uint16_t color = ((uint16_t)(31 - 19 * sleep_amount) << 5) | (uint16_t)(31 - 15 * sleep_amount);
     uint16_t wire_color = (color >> 8) | (color << 8);
     for (int top = 0; top < H; top += ROWS) {
         for (int row = 0; row < ROWS; ++row) {
@@ -200,22 +210,78 @@ static void render(void)
     }
 }
 
+static void render_title(int visible)
+{
+    static const uint8_t glyphs[7][7] = {
+        {31, 4, 4, 4, 4, 4, 4},
+        {0, 0, 0, 0, 0, 12, 12},
+        {14, 17, 17, 31, 17, 17, 17},
+        {0, 0, 0, 0, 0, 12, 12},
+        {30, 17, 17, 30, 20, 18, 17},
+        {0, 0, 0, 0, 0, 12, 12},
+        {15, 16, 16, 14, 1, 1, 30}
+    };
+    const int scale = 6, advance = 36;
+    const int left = (W - (7 * advance - scale)) / 2;
+    const int upper = (H - 7 * scale) / 2;
+    for (int top = 0; top < H; top += ROWS) {
+        memset(pixels, 0, W * ROWS * sizeof(*pixels));
+        for (int row = 0; row < ROWS; ++row) {
+            int gy = (top + row - upper);
+            if (gy < 0 || gy >= 7 * scale) continue;
+            for (int x = left; x < W; ++x) {
+                int offset = x - left;
+                int letter = offset / advance;
+                int gx = (offset % advance) / scale;
+                if (letter < visible && letter < 7 && gx < 5 &&
+                    (glyphs[letter][gy / scale] & (1U << (4 - gx)))) {
+                    pixels[row * W + x] = 0xFF03;
+                }
+            }
+        }
+        command(0x2A, (uint8_t[]){0, 0, 1, 63}, 4);
+        command(0x2B, (uint8_t[]){0, top, 0, top + ROWS - 1}, 4);
+        command(0x2C, (const uint8_t *)pixels, W * ROWS * 2);
+    }
+}
+
+static void boot_animation(void)
+{
+    render_title(0);
+    gpio_set_level(LCD_BL, 1);
+    for (int visible = 1; visible <= 7; ++visible) {
+        render_title(visible);
+        vTaskDelay(pdMS_TO_TICKS(180));
+    }
+    vTaskDelay(pdMS_TO_TICKS(600));
+}
+
 void app_main(void)
 {
     pixels = heap_caps_malloc(W * ROWS * 2, MALLOC_CAP_DMA);
     ESP_ERROR_CHECK(pixels ? ESP_OK : ESP_ERR_NO_MEM);
     init_hardware();
+    boot_animation();
     int64_t last_touch = esp_timer_get_time() / 1000;
     int64_t happy_until = 0, blink_at = last_touch + 2500, gaze_at = 0;
     float target_x = 0, target_y = 0;
     int old_x = 0, old_y = 0, movement = 0;
     bool was_down = false;
+    int64_t wake_started = -1, previous_frame = last_touch;
+    float wake_from = 0;
     ESP_LOGI("deskpet", "Olhos e touch iniciados. Toque para acordar; deslize para carinho.");
     while (1) {
         int64_t now = esp_timer_get_time() / 1000;
+        float dt = (now - previous_frame) / 1000.0f;
+        previous_frame = now;
         int x, y;
         bool down = read_touch(&x, &y);
         if (down) {
+            if (!was_down && sleep_amount > 0 && wake_started < 0) {
+                wake_from = sleep_amount;
+                wake_started = now;
+                blink_at = now + WAKE_DURATION_MS + 1500;
+            }
             last_touch = now;
             target_x = (x - W / 2) / 9.0f;
             target_y = (y - H / 2) / 12.0f;
@@ -236,14 +302,24 @@ void app_main(void)
             }
         }
         was_down = down;
-        happy = now < happy_until;
-        sleepy = now - last_touch > 30000;
+        if (wake_started >= 0) {
+            float progress = (float)(now - wake_started) / WAKE_DURATION_MS;
+            sleep_amount = wake_from * (1.0f - smooth_progress(progress));
+            if (progress >= 1) wake_started = -1;
+        } else {
+            sleep_amount = smooth_progress((float)(now - last_touch - DROWSY_AFTER_MS) /
+                                          (ASLEEP_AFTER_MS - DROWSY_AFTER_MS));
+        }
+        happy = now < happy_until && wake_started < 0;
+        float breath = sinf((now % 4000) * (6.2831853f / 4000.0f));
+        float animated_x = target_x * (1.0f - sleep_amount);
+        float animated_y = target_y * (1.0f - sleep_amount) + 2.5f * breath * sleep_amount;
         if (now > blink_at + 180) blink_at = now + 2200 + esp_random() % 3000;
-        float goal = sleepy ? 0.12f : 1.0f;
-        if (now >= blink_at && now < blink_at + 180) goal = 0;
-        openness += (goal - openness) * 0.55f;
-        eye_x += (target_x - eye_x) * 0.20f;
-        eye_y += (target_y - eye_y) * 0.20f;
+        float goal = 1.0f - sleep_amount;
+        if (sleep_amount < 0.8f && wake_started < 0 && now >= blink_at && now < blink_at + 180) goal = 0;
+        openness += (goal - openness) * (1.0f - expf(-dt / 0.065f));
+        eye_x += (animated_x - eye_x) * (1.0f - expf(-dt / 0.18f));
+        eye_y += (animated_y - eye_y) * (1.0f - expf(-dt / 0.18f));
         render();
         gpio_set_level(LCD_BL, 1);
         vTaskDelay(pdMS_TO_TICKS(20));
