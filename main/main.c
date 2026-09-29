@@ -1,4 +1,7 @@
 #include <math.h>
+#include <stdio.h>
+#include "clock_service.h"
+#include "hold_gesture.h"
 #include <stdlib.h>
 #include <string.h>
 #include "driver/gpio.h"
@@ -158,13 +161,6 @@ static bool read_touch(int *x, int *y)
     int pressure = z1 + 4095 - z2;
     bool valid = z1 > 0 && z1 < 4095 && z2 > 0 && z2 < 4095 &&
                  rx > 0 && rx < 4095 && ry > 0 && ry < 4095;
-    static int64_t next_log;
-    int64_t now = esp_timer_get_time() / 1000;
-    if (now >= next_log) {
-        ESP_LOGI("touch", "irq=%d z1=%d z2=%d pressao=%d raw_x=%d raw_y=%d valido=%d",
-                 gpio_get_level(TOUCH_IRQ), z1, z2, pressure, rx, ry, valid);
-        next_log = now + 2000;
-    }
     if (!valid || pressure < TOUCH_PRESSURE_MIN) return false;
     if (TOUCH_SWAP_XY) { int t = rx; rx = ry; ry = t; }
     *x = clamp((rx - TOUCH_MIN) * (W - 1) / (TOUCH_MAX - TOUCH_MIN), 0, W - 1);
@@ -256,17 +252,91 @@ static void boot_animation(void)
     vTaskDelay(pdMS_TO_TICKS(600));
 }
 
+static const uint8_t clock_font[36][7] = {
+    {14,17,19,21,25,17,14},{4,12,4,4,4,4,14},{14,17,1,2,4,8,31},
+    {30,1,1,14,1,1,30},{2,6,10,18,31,2,2},{31,16,16,30,1,1,30},
+    {14,16,16,30,17,17,14},{31,1,2,4,8,8,8},{14,17,17,14,17,17,14},
+    {14,17,17,15,1,1,14},{14,17,17,31,17,17,17},{30,17,17,30,17,17,30},
+    {14,17,16,16,16,17,14},{30,17,17,17,17,17,30},{31,16,16,30,16,16,31},
+    {31,16,16,30,16,16,16},{14,17,16,23,17,17,15},{17,17,17,31,17,17,17},
+    {14,4,4,4,4,4,14},{7,2,2,2,2,18,12},{17,18,20,24,20,18,17},
+    {16,16,16,16,16,16,31},{17,27,21,21,17,17,17},{17,25,25,21,19,19,17},
+    {14,17,17,17,17,17,14},{30,17,17,30,16,16,16},{14,17,17,17,21,18,13},
+    {30,17,17,30,20,18,17},{15,16,16,14,1,1,30},{31,4,4,4,4,4,4},
+    {17,17,17,17,17,17,14},{17,17,17,17,17,10,4},{17,17,17,21,21,21,10},
+    {17,17,10,4,10,17,17},{17,17,10,4,4,4,4},{31,1,2,4,8,16,31}
+};
+
+static uint8_t glyph_row(char c, int row)
+{
+    if (c >= '0' && c <= '9') return clock_font[c - '0'][row];
+    if (c >= 'A' && c <= 'Z') return clock_font[c - 'A' + 10][row];
+    if (c == ':') return row == 2 || row == 5 ? 4 : 0;
+    if (c == '/') return 1U << (row < 5 ? row : 4);
+    if (c == '-') return row == 3 ? 14 : 0;
+    return 0;
+}
+
+static void clock_text(int top, const char *text, int y, int scale, uint16_t color)
+{
+    int length = strlen(text);
+    int left = (W - (length * 6 - 1) * scale) / 2;
+    uint16_t wire = (color >> 8) | (color << 8);
+    for (int row = 0; row < ROWS; ++row) {
+        int gy = top + row - y;
+        if (gy < 0 || gy >= 7 * scale) continue;
+        for (int i = 0; i < length; ++i) {
+            uint8_t bits = glyph_row(text[i], gy / scale);
+            for (int column = 0; column < 5; ++column) {
+                if (!(bits & (1U << (4 - column)))) continue;
+                for (int dx = 0; dx < scale; ++dx) {
+                    int x = left + (i * 6 + column) * scale + dx;
+                    if (x >= 0 && x < W) pixels[row * W + x] = wire;
+                }
+            }
+        }
+    }
+}
+
+static void render_clock(void)
+{
+    static const char *days[] = {"DOMINGO", "SEGUNDA", "TERCA", "QUARTA", "QUINTA", "SEXTA", "SABADO"};
+    struct tm local;
+    bool valid = clock_service_read(&local);
+    char hour[8] = "--:--", date[16] = "--/--/----";
+    if (valid) {
+        strftime(hour, sizeof(hour), "%H:%M", &local);
+        strftime(date, sizeof(date), "%d/%m/%Y", &local);
+    }
+    for (int top = 0; top < H; top += ROWS) {
+        memset(pixels, 0, W * ROWS * sizeof(*pixels));
+        clock_text(top, valid ? days[local.tm_wday] : "AGUARDANDO HORA", 26, 2, 0x03FF);
+        clock_text(top, hour, 65, 8, 0x03FF);
+        clock_text(top, date, 143, 3, 0xFFFF);
+        clock_text(top, valid ? "SEGURE PARA VOLTAR" :
+                   (clock_service_configured() ? "SINCRONIZANDO WIFI" : "CONFIGURE O WIFI"),
+                   197, 2, 0x7BEF);
+
+        command(0x2A, (uint8_t[]){0, 0, 1, 63}, 4);
+        command(0x2B, (uint8_t[]){0, top, 0, top + ROWS - 1}, 4);
+        command(0x2C, (const uint8_t *)pixels, W * ROWS * 2);
+    }
+}
+
 void app_main(void)
 {
     pixels = heap_caps_malloc(W * ROWS * 2, MALLOC_CAP_DMA);
     ESP_ERROR_CHECK(pixels ? ESP_OK : ESP_ERR_NO_MEM);
     init_hardware();
     boot_animation();
+    clock_service_init();
     int64_t last_touch = esp_timer_get_time() / 1000;
     int64_t happy_until = 0, blink_at = last_touch + 2500, gaze_at = 0;
     float target_x = 0, target_y = 0;
     int old_x = 0, old_y = 0, movement = 0;
-    bool was_down = false;
+    bool was_down = false, clock_mode = false;
+    hold_gesture_t gesture = {0};
+    int64_t clock_redraw = 0;
     int64_t wake_started = -1, previous_frame = last_touch;
     float wake_from = 0;
     ESP_LOGI("deskpet", "Olhos e touch iniciados. Toque para acordar; deslize para carinho.");
@@ -274,8 +344,28 @@ void app_main(void)
         int64_t now = esp_timer_get_time() / 1000;
         float dt = (now - previous_frame) / 1000.0f;
         previous_frame = now;
-        int x, y;
+        int x = 0, y = 0;
         bool down = read_touch(&x, &y);
+        if (hold_update(&gesture, down, x, y, now)) {
+            clock_mode = !clock_mode;
+            happy_until = 0;
+            movement = 0;
+            sleep_amount = 0;
+            wake_started = -1;
+            last_touch = now;
+            clock_redraw = 0;
+        }
+        if (clock_mode) {
+            last_touch = now;
+            was_down = false;
+            if (now >= clock_redraw) {
+                render_clock();
+                clock_redraw = now + 1000;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (gesture.active && gesture.consumed) down = false;
         if (down) {
             if (!was_down && sleep_amount > 0 && wake_started < 0) {
                 wake_from = sleep_amount;

@@ -1,0 +1,8 @@
+menu "T.A.R.S. Clock"
+    config TARS_WIFI_SSID
+        string "Wi-Fi network name (2.4 GHz)"
+        default ""
+    config TARS_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+endmenu
